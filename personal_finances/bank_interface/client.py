@@ -11,6 +11,8 @@ import os
 import signal
 import requests
 import logging
+from .disk_token_store import DiskTokenStore
+from .token_store import TokenObject, gocardless_token_adapter
 
 
 LOGGER = logging.getLogger(__name__)
@@ -38,15 +40,23 @@ def log_wrapper(func: Callable, *args: Any, **kwargs: Any) -> Any:
 
 EMPTY_TRANSACTIONS: Dict[str, List] = {"booked": [], "pending": []}
 
+# Warning: the application does not support multiple users, however some features
+#          do support it and this temporary variable is used across features
+#          supporing multiple users.
+TEMPORARY_FIXED_USER_ID = "temporary-user-id"
+
 
 class BankClient:
     def __init__(self, auth: NordigenAuth, bank_details: List[BankDetails]):
         self.bank_details = bank_details
+
         self._nordigen_client = NordigenClient(
             secret_id=auth.secret_id,
             secret_key=auth.secret_key,
         )
-        self._token = log_wrapper(self._nordigen_client.generate_token)
+
+        self._handle_tokens()
+
         LOGGER.info("client initialized")
 
     def __enter__(self) -> BankClient:
@@ -68,6 +78,24 @@ class BankClient:
             signal.SIGTERM,
         )
         LOGGER.info("uvicorn server killed")
+
+    def _handle_tokens(self) -> None:
+        self._token_store = DiskTokenStore()
+        if self._token_store.is_access_token_valid(TEMPORARY_FIXED_USER_ID):
+            self._nordigen_client.token = self._token_store.get_last_token(
+                TEMPORARY_FIXED_USER_ID
+            ).AccessToken
+
+        elif self._token_store.is_refresh_token_valid(TEMPORARY_FIXED_USER_ID):
+            self._nordigen_client.exchange_token(
+                self._token_store.get_last_token(TEMPORARY_FIXED_USER_ID).RefreshToken
+            )
+
+        else:
+            # Users are prompted with URLs to authorize their bank data
+            new_token = log_wrapper(self._nordigen_client.generate_token)
+            token_object = gocardless_token_adapter(new_token)
+            self._token_store.save_token(TEMPORARY_FIXED_USER_ID, token_object)
 
     def _create_bank_sessions(self) -> Iterable[NordigenSession]:
         institution_ids: Iterable[Any] = map(
